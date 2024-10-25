@@ -1,0 +1,540 @@
+--[[
+    higlight.lua v0.0.2 by exxtremewa#9394
+    
+    Features:
+     - uses the power of fancy syntax detection algorithms to convert a frame into a syntax highlighted high quality code box
+     - is cool
+     
+    Improvements:
+     - Better memory management
+     - Improved performance
+     - Enhanced error handling
+     - Better code organization
+     - Cached pattern compilation
+     - Optimized string operations
+]]
+
+local cloneref = cloneref or function(...) return ... end
+local TextService = cloneref(game:GetService("TextService"))
+local RunService = cloneref(game:GetService("RunService"))
+
+-- Constants
+local BATCH_SIZE = 1000
+local LINE_SPACE = 15
+local TEXT_SIZE = 14
+local FONT = Enum.Font.Ubuntu
+local TAB_SIZE = 4
+
+-- Colors
+local COLORS = {
+    BACKGROUND = Color3.fromRGB(40, 44, 52),
+    OPERATOR = Color3.fromRGB(187, 85, 255),
+    FUNCTION = Color3.fromRGB(97, 175, 239),
+    STRING = Color3.fromRGB(152, 195, 121),
+    NUMBER = Color3.fromRGB(209, 154, 102),
+    BOOLEAN = Color3.fromRGB(209, 154, 102),
+    OBJECT = Color3.fromRGB(229, 192, 123),
+    DEFAULT = Color3.fromRGB(224, 108, 117),
+    COMMENT = Color3.fromRGB(148, 148, 148),
+    LINE_NUMBER = Color3.fromRGB(148, 148, 148),
+    GENERIC = Color3.fromRGB(240, 240, 240)
+}
+
+-- Cached patterns
+local PATTERNS = {
+    operators = {},
+    strings = {{"\"", "\""}, {"'", "'"}, {"%[%[", "%]%]", true}},
+    comments = {"%-%-%[%[[^%]%]]+%]?%]?", "(%-%-[^\n]+)"},
+    functions = {"[^%w_]([%a_][%a%d_]*)%s*%(", "^([%a_][%a%d_]*)%s*%(", "[:%.%(%[%p]([%a_][%a%d_]*)%s*%("},
+    numbers = {"[^%w_](%d+[eE]?%d*)", "[^%w_](%.%d+[eE]?%d*)", "[^%w_](%d+%.%d+[eE]?%d*)", "^(%d+[eE]?%d*)", "^(%.%d+[eE]?%d*)", "^(%d+%.%d+[eE]?%d*)"},
+    booleans = {"[^%w_](true)", "^(true)", "[^%w_](false)", "^(false)", "[^%w_](nil)", "^(nil)"},
+    objects = {"[^%w_:]([%a_][%a%d_]*):", "^([%a_][%a%d_]*):"},
+    other = {"[^_%s%w=>~<%-%+%*]", ">", "~", "<", "%-", "%+", "=", "%*"}
+}
+
+-- Initialize operator patterns
+do
+    local keywords = {"function", "local", "if", "for", "while", "then", "do", "else", "elseif", "return", "end", "continue", "and", "not", "or"}
+    for _, keyword in ipairs(keywords) do
+        table.insert(PATTERNS.operators, "^(" .. keyword .. ")[^%w_]")
+        table.insert(PATTERNS.operators, "[^%w_](" .. keyword .. ")[^%w_]")
+    end
+end
+
+-- HTML entity escape table
+local HTML_ESCAPES = {
+    ["<"] = "&lt;",
+    [">"] = "&gt;",
+    ['"'] = "&quot;",
+    ["'"] = "&apos;",
+    ["&"] = "&amp;"
+}
+
+--- The Highlight class
+--- @class Highlight
+local Highlight = {}
+Highlight.__index = Highlight
+
+-- Private properties
+local function createPrivateState()
+    return {
+        parentFrame = nil,
+        scrollingFrame = nil,
+        textFrame = nil,
+        lineNumbersFrame = nil,
+        lines = {},
+        tableContents = {},
+        line = 0,
+        largestX = 0,
+        offLimits = {}
+    }
+end
+
+-- Utility functions
+local function isOffLimits(state, index)
+    for _, v in next, state.offLimits do
+        if index >= v[1] and index <= v[2] then
+            return true
+        end
+    end
+    return false
+end
+
+local function gfind(str, pattern)
+    return coroutine.wrap(function()
+        local start = 0
+        while true do
+            local findStart, findEnd = str:find(pattern, start)
+            if findStart and findEnd ~= #str then
+                start = findEnd + 1
+                coroutine.yield(findStart, findEnd)
+            else
+                return
+            end
+        end
+    end)
+end
+
+local function autoEscape(s)
+    return (s:gsub("[<>\"'&]", HTML_ESCAPES))
+end
+
+local function updateZIndex(state)
+    local zIndex = state.parentFrame.ZIndex
+    for _, v in next, state.parentFrame:GetDescendants() do
+        if v:IsA("GuiObject") then
+            v.ZIndex = zIndex
+        end
+    end
+end
+
+local function updateCanvasSize(state)
+    state.scrollingFrame.CanvasSize = UDim2.new(0, state.largestX, 0, state.line * LINE_SPACE)
+end
+
+local function onFrameSizeChange(state)
+    local newSize = state.parentFrame.AbsoluteSize
+    state.scrollingFrame.Size = UDim2.new(0, newSize.X, 0, newSize.Y)
+end
+
+-- Rendering functions
+local function renderComments(self, state)
+    local str = self:getRaw()
+    local step = 1
+    
+    for _, pattern in next, PATTERNS.comments do
+        for commentStart, commentEnd in gfind(str, pattern) do
+            if step % BATCH_SIZE == 0 then
+                RunService.Heartbeat:Wait()
+            end
+            step += 1
+            
+            if not isOffLimits(state, commentStart) then
+                table.insert(state.offLimits, {commentStart, commentEnd})
+                for i = commentStart, commentEnd do
+                    if state.tableContents[i] then
+                        state.tableContents[i].Color = COLORS.COMMENT
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function renderStrings(self, state)
+    local stringContext = {
+        type = nil,
+        endType = nil,
+        ignoreBackslashes = nil,
+        start = nil,
+        offLimitsIndex = nil
+    }
+    
+    local function endString(index)
+        stringContext.type = nil
+        stringContext.endType = nil
+        stringContext.ignoreBackslashes = nil
+        state.offLimits[stringContext.offLimitsIndex][2] = index
+    end
+    
+    for i, char in next, state.tableContents do
+        if stringContext.type then
+            char.Color = COLORS.STRING
+            local possibleString = table.concat(
+                table.map(state.tableContents, 
+                    function(c) return c.Char end, 
+                    stringContext.start, i)
+            )
+            
+            if char.Char:match(stringContext.endType) and (
+                stringContext.ignoreBackslashes or
+                (#(possibleString:match("(\\*)" .. stringContext.endType .. "$") or "") % 2 == 0)
+            ) then
+                endString(i)
+                goto continue
+            end
+        end
+        
+        if not stringContext.type then
+            for _, v in next, PATTERNS.strings do
+                if char.Char:match(v[1]) and not isOffLimits(state, i) then
+                    stringContext.type = v[1]
+                    stringContext.endType = v[2]
+                    stringContext.ignoreBackslashes = v[3]
+                    char.Color = COLORS.STRING
+                    stringContext.start = i
+                    stringContext.offLimitsIndex = #state.offLimits + 1
+                    state.offLimits[stringContext.offLimitsIndex] = {i, math.huge}
+                    break
+                end
+            end
+        end
+        
+        ::continue::
+    end
+end
+
+local function highlightPattern(self, state, patternArray, color)
+    local str = self:getRaw()
+    local step = 1
+    
+    for _, pattern in next, patternArray do
+        for findStart, findEnd in gfind(str, pattern) do
+            if step % BATCH_SIZE == 0 then
+                RunService.Heartbeat:Wait()
+            end
+            step += 1
+            
+            if not isOffLimits(state, findStart) and not isOffLimits(state, findEnd) then
+                for i = findStart, findEnd do
+                    if state.tableContents[i] then
+                        state.tableContents[i].Color = color
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function render(self, state)
+    state.offLimits = {}
+    state.lines = {}
+    state.textFrame:ClearAllChildren()
+    state.lineNumbersFrame:ClearAllChildren()
+
+    -- Perform syntax highlighting
+    highlightPattern(self, state, PATTERNS.functions, COLORS.FUNCTION)
+    highlightPattern(self, state, PATTERNS.numbers, COLORS.NUMBER)
+    highlightPattern(self, state, PATTERNS.operators, COLORS.OPERATOR)
+    highlightPattern(self, state, PATTERNS.objects, COLORS.OBJECT)
+    highlightPattern(self, state, PATTERNS.booleans, COLORS.BOOLEAN)
+    highlightPattern(self, state, PATTERNS.other, COLORS.GENERIC)
+    renderComments(self, state)
+    renderStrings(self, state)
+
+    -- Render text
+    local currentLine = {
+        text = "",
+        rawText = "",
+        lastColor = nil
+    }
+    
+    state.largestX = 0
+    state.line = 1
+
+    local function finishLine(isLastLine)
+        if currentLine.lastColor then
+            currentLine.text = currentLine.text .. "</font>"
+        end
+
+        if #currentLine.text > 0 or not isLastLine then
+            local lineText = Instance.new("TextLabel")
+            local x = TextService:GetTextSize(
+                currentLine.rawText, 
+                TEXT_SIZE,
+                FONT,
+                Vector2.new(math.huge, math.huge)
+            ).X + 60
+
+            state.largestX = math.max(state.largestX, x)
+
+            lineText.TextXAlignment = Enum.TextXAlignment.Left
+            lineText.TextYAlignment = Enum.TextYAlignment.Top
+            lineText.Position = UDim2.new(0, 0, 0, state.line * LINE_SPACE - LINE_SPACE / 2)
+            lineText.Size = UDim2.new(0, x, 0, TEXT_SIZE)
+            lineText.RichText = true
+            lineText.Font = FONT
+            lineText.TextSize = TEXT_SIZE
+            lineText.BackgroundTransparency = 1
+            lineText.Text = currentLine.text
+            lineText.Parent = state.textFrame
+
+            if not isLastLine then
+                local lineNumber = Instance.new("TextLabel")
+                lineNumber.Text = state.line
+                lineNumber.Font = FONT
+                lineNumber.TextSize = TEXT_SIZE
+                lineNumber.Size = UDim2.new(1, 0, 0, LINE_SPACE)
+                lineNumber.TextXAlignment = Enum.TextXAlignment.Right
+                lineNumber.TextColor3 = COLORS.LINE_NUMBER
+                lineNumber.Position = UDim2.new(0, 0, 0, state.line * LINE_SPACE - LINE_SPACE / 2)
+                lineNumber.BackgroundTransparency = 1
+                lineNumber.Parent = state.lineNumbersFrame
+            end
+
+            currentLine.text = ""
+            currentLine.rawText = ""
+            currentLine.lastColor = nil
+            state.line += 1
+
+            if state.line % 5 == 0 then
+                updateZIndex(state)
+                updateCanvasSize(state)
+                RunService.Heartbeat:Wait()
+            end
+        end
+    end
+
+    for i = 1, #state.tableContents + 1 do
+        local char = state.tableContents[i]
+        
+        if i == #state.tableContents + 1 or char.Char == "\n" then
+            finishLine(i == #state.tableContents + 1)
+        elseif char.Char == " " then
+            currentLine.text = currentLine.text .. char.Char
+            currentLine.rawText = currentLine.rawText .. char.Char
+        elseif char.Char == "\t" then
+            currentLine.text = currentLine.text .. string.rep(" ", TAB_SIZE)
+            currentLine.rawText = currentLine.rawText .. char.Char
+        else
+            if char.Color == currentLine.lastColor then
+                currentLine.text = currentLine.text .. autoEscape(char.Char)
+            else
+                if currentLine.lastColor then
+                    currentLine.text = currentLine.text .. "</font>"
+                end
+                currentLine.text = currentLine.text .. string.format(
+                    '<font color="rgb(%d,%d,%d)">%s',
+                    char.Color.R * 255,
+                    char.Color.G * 255,
+                    char.Color.B * 255,
+                    autoEscape(char.Char)
+                )
+                currentLine.lastColor = char.Color
+            end
+            currentLine.rawText = currentLine.rawText .. char.Char
+        end
+    end
+
+    updateZIndex(state)
+    updateCanvasSize(state)
+end
+-- Public methods
+function Highlight:init(frame)
+    assert(
+        typeof(frame) == "Instance" and frame:IsA("Frame"),
+        "Initialization error: argument " .. typeof(frame) .. " is not a Frame Instance"
+    )
+    
+    local state = createPrivateState()
+    
+    frame:ClearAllChildren()
+    
+    state.parentFrame = frame
+    state.scrollingFrame = Instance.new("ScrollingFrame")
+    state.textFrame = Instance.new("Frame")
+    state.lineNumbersFrame = Instance.new("Frame")
+    
+    local parentSize = frame.AbsoluteSize
+    state.scrollingFrame.Size = UDim2.new(0, parentSize.X, 0, parentSize.Y)
+    state.scrollingFrame.BackgroundColor3 = COLORS.BACKGROUND
+    state.scrollingFrame.BorderSizePixel = 0
+    state.scrollingFrame.ScrollBarThickness = 4
+
+    state.textFrame.Size = UDim2.new(1, -40, 1, 0)
+    state.textFrame.Position = UDim2.new(0, 40, 0, 0)
+    state.textFrame.BackgroundTransparency = 1
+
+    state.lineNumbersFrame.Size = UDim2.new(0, 25, 1, 0)
+    state.lineNumbersFrame.BackgroundTransparency = 1
+
+    state.textFrame.Parent = state.scrollingFrame
+    state.lineNumbersFrame.Parent = state.scrollingFrame
+    state.scrollingFrame.Parent = state.parentFrame
+
+    -- Set up event connections
+    frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        onFrameSizeChange(state)
+    end)
+    frame:GetPropertyChangedSignal("ZIndex"):Connect(function()
+        updateZIndex(state)
+    end)
+
+    -- Store state in the instance
+    setmetatable(self, {
+        __index = Highlight,
+        __state = state
+    })
+    
+    render(self, state)
+end
+
+function Highlight:setRaw(raw)
+    local state = getmetatable(self).__state
+    raw = raw .. "\n"
+    state.tableContents = {}
+    
+    -- Pre-allocate table for better performance
+    local length = #raw
+    table.resize(state.tableContents, length)
+    
+    for i = 1, length do
+        state.tableContents[i] = {
+            Char = raw:sub(i, i),
+            Color = COLORS.DEFAULT
+        }
+        if i % BATCH_SIZE == 0 then
+            RunService.Heartbeat:Wait()
+        end
+    end
+    
+    render(self, state)
+end
+
+function Highlight:getRaw()
+    local state = getmetatable(self).__state
+    local buffer = table.create(#state.tableContents)
+    
+    for i, char in ipairs(state.tableContents) do
+        buffer[i] = char.Char
+    end
+    
+    return table.concat(buffer)
+end
+
+function Highlight:getString()
+    local state = getmetatable(self).__state
+    local buffer = table.create(#state.tableContents)
+    
+    for i, char in ipairs(state.tableContents) do
+        buffer[i] = char.Char:sub(1, 1)
+    end
+    
+    return table.concat(buffer)
+end
+
+function Highlight:getTable()
+    local state = getmetatable(self).__state
+    return table.clone(state.tableContents)
+end
+
+function Highlight:getSize()
+    local state = getmetatable(self).__state
+    return #state.tableContents
+end
+
+function Highlight:getLine(lineNumber)
+    assert(type(lineNumber) == "number", "Line number must be a number")
+    local state = getmetatable(self).__state
+    
+    local currentLine = 1
+    local buffer = {}
+    local foundLine = false
+    
+    for _, char in ipairs(state.tableContents) do
+        if currentLine == lineNumber then
+            foundLine = true
+            if char.Char == "\n" then
+                break
+            end
+            table.insert(buffer, char.Char)
+        elseif char.Char == "\n" then
+            currentLine = currentLine + 1
+        end
+    end
+    
+    assert(foundLine, "Line " .. lineNumber .. " not found")
+    return table.concat(buffer)
+end
+
+function Highlight:setLine(lineNumber, text)
+    assert(type(lineNumber) == "number", "Line number must be a number")
+    assert(type(text) == "string", "Text must be a string")
+    
+    local state = getmetatable(self).__state
+    local content = self:getRaw()
+    local lines = {}
+    local currentPos = 1
+    
+    -- Split content into lines
+    for line in content:gmatch("([^\n]*)\n?") do
+        table.insert(lines, line)
+    end
+    
+    -- Ensure the line exists
+    while #lines < lineNumber do
+        table.insert(lines, "")
+    end
+    
+    -- Replace the line
+    lines[lineNumber] = text
+    
+    -- Rejoin and update
+    self:setRaw(table.concat(lines, "\n"))
+end
+
+function Highlight:insertLine(lineNumber, text)
+    assert(type(lineNumber) == "number", "Line number must be a number")
+    assert(type(text) == "string", "Text must be a string")
+    
+    local state = getmetatable(self).__state
+    local content = self:getRaw()
+    local lines = {}
+    
+    -- Split content into lines
+    for line in content:gmatch("([^\n]*)\n?") do
+        table.insert(lines, line)
+    end
+    
+    -- Ensure the line exists
+    while #lines < lineNumber do
+        table.insert(lines, "")
+    end
+    
+    -- Insert the new line
+    table.insert(lines, lineNumber, text)
+    
+    -- Rejoin and update
+    self:setRaw(table.concat(lines, "\n"))
+end
+
+-- Constructor
+local constructor = {}
+
+function constructor.new(...)
+    local instance = setmetatable({}, Highlight)
+    instance:init(...)
+    return instance
+end
+
+return constructor
