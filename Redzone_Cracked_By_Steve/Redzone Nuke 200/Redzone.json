@@ -1,0 +1,13 @@
+{
+    "token": "Token",
+    "prefix": "rz!",
+    "webhook_name": "Redzone Shop",
+    "webhook_title": "Redzone Shop",
+    "content": "@everyone @here ",
+    "title_url": "https://discord.gg/RedzoneShop",
+    "icon_url": "https://cdn.discordapp.com/attachments/902137023698190366/924664970875138098/PicsArt_12-20-07.46.55.jpg",
+    "avatar_url": "https://cdn.discordapp.com/attachments/902137023698190366/924664970875138098/PicsArt_12-20-07.46.55.jpg",
+    "description": "```https://discord.gg/RedzoneShop```",
+    "embed_footer": "Redzone Shop",
+    "image_url": "https://cdn.discordapp.com/attachments/902137023698190366/924664927564750868/20211226_205633.gif"
+}
